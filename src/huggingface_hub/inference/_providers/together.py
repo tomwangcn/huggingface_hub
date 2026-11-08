@@ -1,13 +1,17 @@
 import base64
+import json
+import secrets
 import time
 from abc import ABC
 from typing import Any
 
 from huggingface_hub.hf_api import InferenceProviderMapping
 from huggingface_hub.inference._common import (
+    MimeBytes,
     RequestParameters,
     _as_dict,
     _as_url,
+    _open_as_mime_bytes,
 )
 from huggingface_hub.inference._providers._common import (
     BaseConversationalTask,
@@ -34,6 +38,41 @@ _VIDEO_MAX_POLL_ATTEMPTS = 150  # ~5 minutes at _VIDEO_POLLING_INTERVAL
 _VIDEO_PENDING_STATUSES = {"queued", "in_progress"}
 
 
+def _coerce_multipart(value: Any) -> str | bytes | tuple:
+    """Coerce a value to a type accepted by multipart/form-data fields."""
+    if isinstance(value, (str, bytes, tuple)):
+        return value
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value)
+    return str(value)
+
+
+def _encode_multipart_formdata(fields: dict[str, Any]) -> tuple[bytes, str]:
+    """Encode fields as multipart/form-data (RFC 2388), stdlib-only.
+
+    `urllib3.filepost.encode_multipart_formdata` was used previously, but urllib3 is not a
+    dependency of `huggingface_hub`, so the multipart body is assembled directly here.
+    Each value is a `str`/`bytes` field, or a `(filename, data, content_type)` file tuple.
+    """
+    boundary = secrets.token_hex(16)
+    chunks: list[bytes] = []
+    for name, value in fields.items():
+        chunks.append(f"--{boundary}\r\n".encode())
+        if isinstance(value, tuple):
+            filename, data, content_type = value
+            chunks.append(f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'.encode())
+            chunks.append(f"Content-Type: {content_type}\r\n\r\n".encode())
+            chunks.append(bytes(data))
+        else:
+            chunks.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
+            chunks.append(value if isinstance(value, bytes) else str(value).encode())
+        chunks.append(b"\r\n")
+    chunks.append(f"--{boundary}--\r\n".encode())
+    return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+
+
 class TogetherTask(TaskProviderHelper, ABC):
     """Base class for Together API tasks."""
 
@@ -46,6 +85,8 @@ class TogetherTask(TaskProviderHelper, ABC):
                 return "/v1/images/generations"
             case "text-to-speech":
                 return "/v1/audio/speech"
+            case "automatic-speech-recognition":
+                return "/v1/audio/transcriptions"
             case "feature-extraction":
                 return "/v1/embeddings"
             case "text-to-video" | "image-to-video":
@@ -191,6 +232,52 @@ class TogetherTextToSpeechTask(TogetherTask):
         if isinstance(response, bytes):
             return response
         raise ValueError(f"Expected raw audio bytes for text-to-speech, got {type(response).__name__}.")
+
+
+class TogetherAutomaticSpeechRecognitionTask(TogetherTask):
+    def __init__(self):
+        super().__init__("automatic-speech-recognition")
+
+    def _prepare_payload_as_bytes(
+        self,
+        inputs: Any,
+        parameters: dict,
+        provider_mapping_info: InferenceProviderMapping,
+        extra_payload: dict | None,
+    ) -> MimeBytes | None:
+        fields: dict[str, Any] = {"model": provider_mapping_info.provider_id}
+
+        if isinstance(inputs, str) and inputs.startswith(("http://", "https://")):
+            # The API also accepts a public HTTPS URL string in the `file` form field.
+            fields["file"] = inputs
+        else:
+            audio = _open_as_mime_bytes(inputs)
+            mime_type = audio.mime_type or "audio/wav"
+            extension = mime_type.rsplit("/", 1)[-1]
+            fields["file"] = (f"audio.{extension}", bytes(audio), mime_type)
+
+        for key, value in filter_none(parameters or {}).items():
+            fields[key] = _coerce_multipart(value)
+        for key, value in filter_none(extra_payload or {}).items():
+            fields[key] = _coerce_multipart(value)
+
+        body, content_type = _encode_multipart_formdata(fields)
+        return MimeBytes(body, mime_type=content_type)
+
+    def get_response(self, response: bytes | dict, request_params: RequestParameters | None = None) -> Any:
+        response_dict = _as_dict(response)
+        text = response_dict.get("text")
+        if not isinstance(text, str):
+            raise ValueError(f"Unexpected ASR response from Together: missing 'text' field. Got: {response!r}")
+        out: dict[str, Any] = {"text": text}
+        segments = response_dict.get("segments")
+        if isinstance(segments, list):
+            out["chunks"] = [
+                {"text": seg.get("text"), "timestamp": [seg.get("start"), seg.get("end")]}
+                for seg in segments
+                if isinstance(seg, dict)
+            ]
+        return out
 
 
 def _normalize_video_parameters(parameters: dict) -> dict:

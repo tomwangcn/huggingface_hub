@@ -48,6 +48,7 @@ from .replicate import (
 )
 from .scaleway import ScalewayConversationalTask, ScalewayFeatureExtractionTask
 from .together import (
+    TogetherAutomaticSpeechRecognitionTask,
     TogetherConversationalTask,
     TogetherFeatureExtractionTask,
     TogetherImageToImageTask,
@@ -189,6 +190,7 @@ PROVIDERS: dict[PROVIDER_T, dict[str, TaskProviderHelper]] = {
         "feature-extraction": ScalewayFeatureExtractionTask(),
     },
     "together": {
+        "automatic-speech-recognition": TogetherAutomaticSpeechRecognitionTask(),
         "conversational": TogetherConversationalTask(),
         "feature-extraction": TogetherFeatureExtractionTask(),
         "image-to-image": TogetherImageToImageTask(),
